@@ -28,6 +28,8 @@ import (
 	"github.com/netbirdio/netbird/client/firewall"
 	firewallManager "github.com/netbirdio/netbird/client/firewall/manager"
 	"github.com/netbirdio/netbird/client/iface"
+	"github.com/netbirdio/netbird/client/iface/wgaddr"
+	"github.com/netbirdio/netbird/shared/netiputil"
 	"github.com/netbirdio/netbird/client/iface/device"
 	nbnetstack "github.com/netbirdio/netbird/client/iface/netstack"
 	"github.com/netbirdio/netbird/client/iface/udpmux"
@@ -83,8 +85,9 @@ type EngineConfig struct {
 	WgPort      int
 	WgIfaceName string
 
-	// WgAddr is a Wireguard local address (Netbird Network IP)
-	WgAddr string
+	// WgAddr is the Wireguard local address (Netbird Network IP).
+	// Contains both v4 and optional v6 overlay addresses.
+	WgAddr wgaddr.Address
 
 	// WgPrivateKey is a Wireguard private key of our peer (it MUST never leave the machine)
 	WgPrivateKey wgtypes.Key
@@ -129,6 +132,7 @@ type EngineConfig struct {
 	DisableFirewall     bool
 	BlockLANAccess      bool
 	BlockInbound        bool
+	DisableIPv6         bool
 
 	LazyConnectionEnabled bool
 
@@ -697,7 +701,7 @@ func (e *Engine) modifyPeers(peersUpdate []*mgmProto.RemotePeerConfig) error {
 		if !ok {
 			continue
 		}
-		if !compareNetIPLists(allowedIPs, p.GetAllowedIps()) {
+		if !compareNetIPLists(allowedIPs, e.filterAllowedIPs(p.GetAllowedIps())) {
 			modified = append(modified, p)
 			continue
 		}
@@ -969,6 +973,7 @@ func (e *Engine) updateChecksIfNew(checks []*mgmProto.Checks) error {
 		e.config.DisableFirewall,
 		e.config.BlockLANAccess,
 		e.config.BlockInbound,
+		e.config.DisableIPv6,
 		e.config.LazyConnectionEnabled,
 		e.config.EnableSSHRoot,
 		e.config.EnableSSHSFTP,
@@ -996,6 +1001,13 @@ func (e *Engine) updateConfig(conf *mgmProto.PeerConfig) error {
 		return ErrResetConnection
 	}
 
+	if !e.config.DisableIPv6 && e.hasIPv6Changed(conf) {
+		log.Infof("peer IPv6 address changed, restarting client")
+		_ = CtxGetState(e.ctx).Wrap(ErrResetConnection)
+		e.clientCancel()
+		return ErrResetConnection
+	}
+
 	if conf.GetSshConfig() != nil {
 		if err := e.updateSSH(conf.GetSshConfig()); err != nil {
 			log.Warnf("failed handling SSH server setup: %v", err)
@@ -1004,6 +1016,7 @@ func (e *Engine) updateConfig(conf *mgmProto.PeerConfig) error {
 
 	state := e.statusRecorder.GetLocalPeerState()
 	state.IP = e.wgInterface.Address().String()
+	state.IPv6 = e.wgInterface.Address().IPv6String()
 	state.PubKey = e.config.WgPrivateKey.PublicKey().String()
 	state.KernelInterface = !e.wgInterface.IsUserspaceBind()
 	state.FQDN = conf.GetFqdn()
@@ -1012,6 +1025,26 @@ func (e *Engine) updateConfig(conf *mgmProto.PeerConfig) error {
 
 	return nil
 }
+
+// hasIPv6Changed reports whether the IPv6 overlay address in the peer config
+// differs from the current interface address (added, removed, or changed).
+func (e *Engine) hasIPv6Changed(conf *mgmProto.PeerConfig) bool {
+	current := e.wgInterface.Address()
+	raw := conf.GetAddressV6()
+
+	if len(raw) == 0 {
+		return current.HasIPv6()
+	}
+
+	addr, err := netiputil.DecodeAddr(raw)
+	if err != nil {
+		log.Warnf("decode v6 overlay address: %v", err)
+		return false
+	}
+
+	return !current.HasIPv6() || current.IPv6 != addr
+}
+
 func (e *Engine) receiveJobEvents() {
 	e.jobExecutorWG.Add(1)
 	go func() {
@@ -1108,6 +1141,7 @@ func (e *Engine) receiveManagementEvents() {
 			e.config.DisableFirewall,
 			e.config.BlockLANAccess,
 			e.config.BlockInbound,
+			e.config.DisableIPv6,
 			e.config.LazyConnectionEnabled,
 			e.config.EnableSSHRoot,
 			e.config.EnableSSHSFTP,
@@ -1428,8 +1462,10 @@ func (e *Engine) updateOfflinePeers(offlinePeers []*mgmProto.RemotePeerConfig) {
 	replacement := make([]peer.State, len(offlinePeers))
 	for i, offlinePeer := range offlinePeers {
 		log.Debugf("added offline peer %s", offlinePeer.Fqdn)
+		v4, v6 := splitAllowedIPs(offlinePeer.GetAllowedIps(), e.wgInterface.Address().IPv6Net)
 		replacement[i] = peer.State{
-			IP:               strings.Join(offlinePeer.GetAllowedIps(), ","),
+			IP:               v4,
+			IPv6:             v6,
 			PubKey:           offlinePeer.GetWgPubKey(),
 			FQDN:             offlinePeer.GetFqdn(),
 			ConnStatus:       peer.StatusIdle,
@@ -1438,6 +1474,30 @@ func (e *Engine) updateOfflinePeers(offlinePeers []*mgmProto.RemotePeerConfig) {
 		}
 	}
 	e.statusRecorder.ReplaceOfflinePeers(replacement)
+}
+
+// splitAllowedIPs separates the peer's overlay v4 (/32) and v6 (/128) addresses
+// from a list of AllowedIPs CIDRs. The v6 address is only matched if it falls
+// within ourV6Net (the local overlay v6 subnet), to avoid confusing routed /128
+// prefixes with the peer's overlay address.
+func splitAllowedIPs(allowedIPs []string, ourV6Net netip.Prefix) (v4, v6 string) {
+	for _, cidr := range allowedIPs {
+		prefix, err := netip.ParsePrefix(cidr)
+		if err != nil {
+			log.Warnf("failed to parse AllowedIP %q: %v", cidr, err)
+			continue
+		}
+		switch {
+		case prefix.Addr().Is4() && prefix.Bits() == 32 && v4 == "":
+			v4 = prefix.Addr().String()
+		case prefix.Addr().Is6() && prefix.Bits() == 128 && ourV6Net.Contains(prefix.Addr()) && v6 == "":
+			v6 = prefix.Addr().String()
+		}
+		if v4 != "" && v6 != "" {
+			break
+		}
+	}
+	return
 }
 
 // addNewPeers adds peers that were not know before but arrived from the Management service with the update
@@ -1465,6 +1525,9 @@ func (e *Engine) addNewPeer(peerConfig *mgmProto.RemotePeerConfig) error {
 			log.Errorf("failed to parse allowedIPS: %v", err)
 			return err
 		}
+		if allowedNetIP.Addr().Is6() && !e.wgInterface.Address().HasIPv6() {
+			continue
+		}
 		peerIPs = append(peerIPs, allowedNetIP)
 	}
 
@@ -1473,7 +1536,15 @@ func (e *Engine) addNewPeer(peerConfig *mgmProto.RemotePeerConfig) error {
 		return fmt.Errorf("create peer connection: %w", err)
 	}
 
-	err = e.statusRecorder.AddPeer(peerKey, peerConfig.Fqdn, peerIPs[0].Addr().String())
+	var peerIPv6 string
+	ourV6Net := e.wgInterface.Address().IPv6Net
+	for _, pip := range peerIPs {
+		if pip.Addr().Is6() && pip.Bits() == 128 && ourV6Net.Contains(pip.Addr()) {
+			peerIPv6 = pip.Addr().String()
+			break
+		}
+	}
+	err = e.statusRecorder.AddPeer(peerKey, peerConfig.Fqdn, peerIPs[0].Addr().String(), peerIPv6)
 	if err != nil {
 		log.Warnf("error adding peer %s to status recorder, got error: %v", peerKey, err)
 	}
@@ -1695,6 +1766,7 @@ func (e *Engine) readInitialSettings() ([]*route.Route, *nbdns.Config, bool, err
 		e.config.DisableFirewall,
 		e.config.BlockLANAccess,
 		e.config.BlockInbound,
+		e.config.DisableIPv6,
 		e.config.LazyConnectionEnabled,
 		e.config.EnableSSHRoot,
 		e.config.EnableSSHSFTP,
@@ -1750,7 +1822,8 @@ func (e *Engine) wgInterfaceCreate() (err error) {
 	case "android":
 		err = e.wgInterface.CreateOnAndroid(e.routeManager.InitialRouteRange(), e.dnsServer.DnsIP().String(), e.dnsServer.SearchDomains())
 	case "ios":
-		e.mobileDep.NetworkChangeListener.SetInterfaceIP(e.config.WgAddr)
+		e.mobileDep.NetworkChangeListener.SetInterfaceIP(e.config.WgAddr.String())
+		e.mobileDep.NetworkChangeListener.SetInterfaceIPv6(e.config.WgAddr.IPv6String())
 		err = e.wgInterface.Create()
 	default:
 		err = e.wgInterface.Create()
@@ -2252,6 +2325,24 @@ func getInterfacePrefixes() ([]netip.Prefix, error) {
 	}
 
 	return prefixes, nberrors.FormatErrorOrNil(merr)
+}
+
+// filterAllowedIPs strips IPv6 entries when the local interface has no v6 address.
+// This covers both the explicit --disable-ipv6 flag (v6 never assigned) and the
+// case where OS v6 assignment failed (ClearIPv6). Without this, WireGuard would
+// accept v6 traffic that the native firewall cannot filter.
+func (e *Engine) filterAllowedIPs(ips []string) []string {
+	if e.wgInterface.Address().HasIPv6() {
+		return ips
+	}
+	filtered := make([]string, 0, len(ips))
+	for _, s := range ips {
+		p, err := netip.ParsePrefix(s)
+		if err != nil || !p.Addr().Is6() {
+			filtered = append(filtered, s)
+		}
+	}
+	return filtered
 }
 
 // compareNetIPLists compares a list of netip.Prefix with a list of strings.
